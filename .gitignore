@@ -3,3 +3,6 @@ certs/
 
 #keys
 *.key
+
+#certs
+*.crt

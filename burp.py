@@ -7,6 +7,13 @@ import threading
 import os
 import shutil
 import uuid
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes
+from datetime import datetime, timedelta, timezone
+import ssl
 
 
 log_queue = queue.Queue()
@@ -16,6 +23,10 @@ class AsyncProxyServer:
         self.port = port or random.randrange(9000, 10000)
         self.proxy = f"{self.host}:{self.port}"
         self.log_queue = log_queue
+        self.cert_dir = "certs" #certificates
+        self.ca_cert = os.path.join(self.cert_dir, "my_proxy_ca.crt")
+        self.ca_key = os.path.join(self.cert_dir, "my_proxy_ca.key")
+        self.cert_dir = os.path.join(self.cert_dir, "cache") #cache
         
 
     async def start(self):
@@ -28,6 +39,7 @@ class AsyncProxyServer:
 
         async with server:
             await server.serve_forever()
+
 
     async def handle_client(self, reader, writer):
         try:
@@ -46,6 +58,7 @@ class AsyncProxyServer:
         except Exception as e:
             print("[ERROR]", e)
 
+
     def forward_request(self, req_id, modified_data=None):
         """Thread-safe method called by the GUI to release a paused request, optionally with new data."""
         if hasattr(self, 'pending_requests') and req_id in self.pending_requests:
@@ -60,7 +73,7 @@ class AsyncProxyServer:
                 self.loop.call_soon_threadsafe(event.set)
 
 
-    async def handle_http(self, data, client_reader, client_writer):
+    async def handle_http(self, data, client_reader, client_writer, https=False):
         is_intercepted_this_request = False
         try:
             # Initialize state variables
@@ -84,7 +97,7 @@ class AsyncProxyServer:
                 port = int(port)
             else:
                 host = host_raw
-                port = 80
+                port = 443 if https else 80
 
             first_line = headers[0] if headers else "UNKNOWN REQUEST"
             method = first_line.split()[0] if len(first_line.split()) > 0 else ""
@@ -104,22 +117,30 @@ class AsyncProxyServer:
             })
 
             if is_intercepted_this_request:
-                print(f"[*] Intercepted and holding request to {host}...")
+                print(f"[~] Intercepted and holding request to {host}...")
                 await intercept_event.wait() 
             
-            # --- NEW: Swap the payload if the user edited it ---
+            # Swap the payload if the user edited i
             payload_to_send = data # Default to original data
             
             if hasattr(self, 'modified_payloads') and req_id in self.modified_payloads:
                 modified_text = self.modified_payloads.pop(req_id)
-                # CRITICAL: Fix Tkinter line endings (\n) back to strict HTTP line endings (\r\n)
                 modified_text = modified_text.replace('\r\n', '\n').replace('\n', '\r\n')
                 payload_to_send = modified_text.encode(errors="ignore")
 
             self.pending_requests.pop(req_id, None)
 
+
+            client_ssl_ctx = None
+            if https: #setup for tls handshake with the websie
+                client_ssl_ctx = ssl.create_default_context()
+                client_ssl_ctx.check_hostname = False
+                client_ssl_ctx.verify_mode = ssl.CERT_NONE
+
             # Open connection to the real remote server
-            remote_reader, remote_writer = await asyncio.open_connection(host, port)
+            remote_reader, remote_writer = await asyncio.open_connection(
+                host, port, ssl=client_ssl_ctx #if none then http
+            )
             
             # Send the final payload (either original or edited)
             remote_writer.write(payload_to_send)
@@ -138,25 +159,48 @@ class AsyncProxyServer:
     async def handle_connect(self, first_line, client_reader, client_writer):
         try:
             target = first_line.split()[1]
-            host, port = target.split(b":")
-            port = int(port)
+            host_bytes, port_bytes = target.split(b":")
+            hostname = host_bytes.decode()
+            # port = int(port)
 
-            remote_reader, remote_writer = await asyncio.open_connection(
-                host.decode(), port
-            )
-
-            client_writer.write(
-                b"HTTP/1.1 200 Connection Established\r\n\r\n"
-            )
+            #tell the browser the tunnel is ready
+            client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await client_writer.drain()
 
-            await asyncio.gather(
-                self.pipe(client_reader, remote_writer),
-                self.pipe(remote_reader, client_writer)
+            #get forged certificates for the domain
+            cert_path, key_path = self.generate_cert(hostname)
+
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+
+            loop = asyncio.get_running_loop()
+
+            new_reader = asyncio.StreamReader()
+            new_protocol = asyncio.StreamReaderProtocol(new_reader)
+            
+
+            transport = client_writer.transport
+            secure_transport = await loop.start_tls( #tls handshake with client
+                transport, 
+                new_protocol, 
+                ssl_context, 
+                server_side=True
             )
 
+            secure_writer = asyncio.StreamWriter(secure_transport, new_protocol, new_reader, loop)
+
+            data = await new_reader.read(65536)
+            
+            if data:
+                #send this decrypted data to our existing HTTP handler
+                #'https' flag so handle_http knows how to forward it
+                await self.handle_http(data, new_reader, secure_writer, https=True)
+
+            
+
         except Exception as e:
-            print("[CONNECT ERROR]", e)
+            print(f"[~] TLS Intercept failed for {hostname}: {e}")
+
 
     async def pipe(self, reader, writer):
         try:
@@ -170,6 +214,65 @@ class AsyncProxyServer:
             pass
         finally:
             writer.close()
+
+
+    #https mitm helper functions
+    def generate_cert(self, hostname):
+        #forgeing certificate if needed to an hostname
+
+        cert_path = os.path.join(self.cert_dir, f"{hostname}.crt")
+        key_path = os.path.join(self.cert_dir, f"{hostname}.key")
+
+        if os.path.exists(cert_path) and os.path.exists(key_path):
+            return cert_path, key_path
+        
+        print(f"[~] Generating certificate for {hostname}")
+
+        forged_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+        )
+
+        with open(self.ca_cert, "rb") as f:
+            ca_cert = x509.load_pem_x509_certificate(f.read())
+        
+
+        with open(self.ca_key, "rb") as f:
+            ca_key = serialization.load_pem_private_key(
+                f.read(),
+                password=None,
+            )
+        
+        #who the site is
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
+
+        now = datetime.now(timezone.utc)
+        cert_start = now - timedelta(days=1) #avoid clock delay errors
+        cert_end = now + timedelta(days=365)
+
+        forged_cert = (
+            x509.CertificateBuilder().subject_name(subject)
+            .issuer_name(ca_cert.subject)
+            .public_key(forged_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(cert_start)
+            .not_valid_after(cert_end)
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False,)
+            .sign(ca_key, hashes.SHA256()) #sign it 
+        )
+
+        #save to cache:
+        with open(cert_path, "wb") as f:
+            f.write(forged_cert.public_bytes(serialization.Encoding.PEM))
+        
+        with open(key_path, "wb") as f:
+            f.write(forged_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption()
+            ))
+
+        return cert_path, key_path
 
 
 class ProxyGUI(ctk.CTk):
@@ -276,11 +379,11 @@ class ProxyGUI(ctk.CTk):
 
     def on_closing(self):
         #This runs when the user clicks the X on the Tkinter GUI
-        print("[*] Shutting down Proxy Tool...")
+        print("[~] Shutting down Proxy Tool...")
         
         #Kill the browser if it's still running
         if self.browser_process and self.browser_process.poll() is None:
-            print("[*] Terminating browser process...")
+            print("[~] Terminating browser process...")
             self.browser_process.terminate()
             self.browser_process.wait() # Wait for it to fully close
 

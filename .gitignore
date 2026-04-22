@@ -1,2 +1,5 @@
 #certificates
 certs/
+
+#keys
+*.key

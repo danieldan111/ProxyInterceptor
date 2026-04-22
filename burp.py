@@ -22,11 +22,21 @@ class AsyncProxyServer:
         self.host = host
         self.port = port or random.randrange(9000, 10000)
         self.proxy = f"{self.host}:{self.port}"
+
         self.log_queue = log_queue
+
         self.cert_dir = "certs" #certificates
         self.ca_cert = os.path.join(self.cert_dir, "my_proxy_ca.crt")
         self.ca_key = os.path.join(self.cert_dir, "my_proxy_ca.key")
         self.cert_dir = os.path.join(self.cert_dir, "cache") #cache
+        os.makedirs(self.cert_dir, exist_ok=True) # Ensures parent and child dirs exist
+
+        self.filter_rules = {
+            "protocol": "All",  # "All", "HTTP", or "HTTPS"
+            "port": "",         # e.g., "443"
+            "include_host": "", # e.g., "example.com"
+            "exclude_host": ""  # e.g., "telemetry.microsoft.com"
+        }
         
 
     async def start(self):
@@ -57,6 +67,15 @@ class AsyncProxyServer:
 
         except Exception as e:
             print("[ERROR]", e)
+        
+        finally:
+            #cleanup for the main client writer
+            if not writer.is_closing():
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
 
     def forward_request(self, req_id, modified_data=None):
@@ -104,6 +123,33 @@ class AsyncProxyServer:
 
             if self.intercept_on:
                 is_intercepted_this_request = True
+                should_intercept = True
+
+                #Protocol Filter
+                if self.filter_rules["protocol"] == "HTTP" and https:
+                    should_intercept = False
+                elif self.filter_rules["protocol"] == "HTTPS" and not https:
+                    should_intercept = False
+                    
+                #Port Filter
+                if self.filter_rules["port"] and str(port) != self.filter_rules["port"]:
+                    should_intercept = False
+                    
+                #Blacklist
+                if self.filter_rules["exclude_host"]:
+                    # Split by comma, clean up spaces, and check if any match
+                    excluded_hosts = [h.strip().lower() for h in self.filter_rules["exclude_host"].split(",") if h.strip()]
+                    if any(ex_host in host.lower() for ex_host in excluded_hosts):
+                        should_intercept = False
+                    
+                #Whitelist
+                if self.filter_rules["include_host"]:
+                    included_hosts = [h.strip().lower() for h in self.filter_rules["include_host"].split(",") if h.strip()]
+                    # If none of the whitelisted hosts are in the current host, do not intercept
+                    if not any(inc_host in host.lower() for inc_host in included_hosts):
+                        should_intercept = False
+                    
+                is_intercepted_this_request = should_intercept
 
             status_tag = "[PAUSED] " if is_intercepted_this_request else ""
             summary = f"{status_tag}{method} {host}:{port}"
@@ -157,17 +203,52 @@ class AsyncProxyServer:
 
 
     async def handle_connect(self, first_line, client_reader, client_writer):
+        secure_writer = None
+        hostname = "UNKNOWN"
         try:
             target = first_line.split()[1]
             host_bytes, port_bytes = target.split(b":")
             hostname = host_bytes.decode()
-            # port = int(port)
+            port = int(port_bytes.decode())
 
-            #tell the browser the tunnel is ready
+            #check filters
+            should_pass_through = False
+            
+            # Check blacklist
+            if self.filter_rules["exclude_host"]:
+                excluded_hosts = [h.strip().lower() for h in self.filter_rules["exclude_host"].split(",") if h.strip()]
+                if any(ex_host in hostname.lower() for ex_host in excluded_hosts):
+                    should_pass_through = True
+                    
+            # Check whitelist
+            elif self.filter_rules["include_host"]:
+                included_hosts = [h.strip().lower() for h in self.filter_rules["include_host"].split(",") if h.strip()]
+                if not any(inc_host in hostname.lower() for inc_host in included_hosts):
+                    should_pass_through = True
+
+            # IF PASS-THROUGH, DO A DIRECT CONNECTION (NO FAKE CERTS)
+            if should_pass_through:
+                try:
+                    remote_reader, remote_writer = await asyncio.open_connection(hostname, port)
+                    
+                    # Tell browser the tunnel is ready
+                    client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    await client_writer.drain()
+                    
+                   
+                    await asyncio.gather(
+                        self.pipe(client_reader, remote_writer),
+                        self.pipe(remote_reader, client_writer)
+                    )
+                    return  # Now it safely returns only when the connection naturally ends
+                except Exception as e:
+                    print(f"[~] Pass-through connection failed for {hostname}: {e}")
+                    return
+
+            #IF WE ARE INTERCEPTING, DO THE MITM TLS HANDSHAKE
             client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await client_writer.drain()
 
-            #get forged certificates for the domain
             cert_path, key_path = self.generate_cert(hostname)
 
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -178,9 +259,8 @@ class AsyncProxyServer:
             new_reader = asyncio.StreamReader()
             new_protocol = asyncio.StreamReaderProtocol(new_reader)
             
-
             transport = client_writer.transport
-            secure_transport = await loop.start_tls( #tls handshake with client
+            secure_transport = await loop.start_tls(
                 transport, 
                 new_protocol, 
                 ssl_context, 
@@ -189,18 +269,25 @@ class AsyncProxyServer:
 
             secure_writer = asyncio.StreamWriter(secure_transport, new_protocol, new_reader, loop)
 
-            data = await new_reader.read(65536)
-            
-            if data:
-                #send this decrypted data to our existing HTTP handler
-                #'https' flag so handle_http knows how to forward it
+            while True:
+                data = await new_reader.read(65536)
+                if not data:
+                    break
                 await self.handle_http(data, new_reader, secure_writer, https=True)
 
-            
-
         except Exception as e:
-            print(f"[~] TLS Intercept failed for {hostname}: {e}")
+            pass # Keep console clean
+            
+        finally:
+            # Bulletproof cleanup
+            if secure_writer is not None and not secure_writer.is_closing():
+                try:
+                    secure_writer.close()
+                    await secure_writer.wait_closed()
+                except Exception:
+                    pass
 
+                
 
     async def pipe(self, reader, writer):
         try:
@@ -287,35 +374,41 @@ class ProxyGUI(ctk.CTk):
         self.keep_logs = True 
         
         self.title("Proxy Tool")
-        self.geometry("850x650") 
+        self.geometry("900x700") 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         #controls frame
         self.controls_frame = ctk.CTkFrame(self)
         self.controls_frame.pack(fill="x", padx=10, pady=10)
 
-        self.open_btn = ctk.CTkButton(self.controls_frame, text="Open Browser", command=self.open_browser)
-        self.open_btn.pack(side="left", padx=5)
+        self.open_btn = ctk.CTkButton(self.controls_frame, text="Open Browser", width=1, command=self.open_browser)
+        self.open_btn.pack(side="left", expand=True, fill="x", padx=5)
 
         self.intercept_btn = ctk.CTkButton(
-            self.controls_frame, text="Intercept is OFF", fg_color="gray", command=self.toggle_intercept
+            self.controls_frame, text="Intercept is OFF", fg_color="gray", width=1, command=self.toggle_intercept
         )
-        self.intercept_btn.pack(side="left", padx=5)
+        self.intercept_btn.pack(side="left", expand=True, fill="x", padx=5)
+
+        self.filter_btn = ctk.CTkButton(
+            self.controls_frame, text="Filters ⚙️", fg_color="#404040", hover_color="#2b2b2b", width=1, command=self.open_filter_window
+        )
+        self.filter_btn.pack(side="left", expand=True, fill="x", padx=5)
 
         self.forward_btn = ctk.CTkButton(
-            self.controls_frame, text="Forward", state="disabled", command=self.forward_selected
+            self.controls_frame, text="Forward", state="disabled", width=1, command=self.forward_selected
         )
-        self.forward_btn.pack(side="left", padx=5)
+        self.forward_btn.pack(side="left", expand=True, fill="x", padx=5)
 
         self.forward_all_btn = ctk.CTkButton(
-            self.controls_frame, text="Forward All", fg_color="#c98a28", hover_color="#a8721e", command=self.forward_all_pending
+            self.controls_frame, text="Forward All", fg_color="#c98a28", hover_color="#a8721e", width=1, command=self.forward_all_pending
         )
-        self.forward_all_btn.pack(side="left", padx=5)
+        self.forward_all_btn.pack(side="left", expand=True, fill="x", padx=5)
 
         self.keep_logs_btn = ctk.CTkButton(
-            self.controls_frame, text="Keep Logs: ON", fg_color="#2c7a2c", hover_color="#1e5c1e", command=self.toggle_keep_logs
+            self.controls_frame, text="Keep Logs: ON", fg_color="#2c7a2c", hover_color="#1e5c1e", width=1, command=self.toggle_keep_logs
         )
-        self.keep_logs_btn.pack(side="left", padx=5)
+        self.keep_logs_btn.pack(side="left", expand=True, fill="x", padx=5)
+
 
         #ui style
         self.history_frame = ctk.CTkScrollableFrame(self, height=200, label_text="HTTP History")
@@ -331,6 +424,85 @@ class ProxyGUI(ctk.CTk):
 
         self.paused_queue = [] 
         self.active_paused_req = None
+
+
+    def open_filter_window(self):
+        # Create a popup window
+        filter_win = ctk.CTkToplevel(self)
+        filter_win.title("Interception Filters")
+        filter_win.geometry("400x400")
+        filter_win.grab_set()  # Forces focus on this popup
+        
+        #Protocol filter
+        ctk.CTkLabel(filter_win, text="Protocol:").pack(pady=(10, 0))
+        protocol_var = ctk.StringVar(value=self.proxy.filter_rules["protocol"])
+        protocol_menu = ctk.CTkOptionMenu(filter_win, values=["All", "HTTP", "HTTPS"], variable=protocol_var)
+        protocol_menu.pack(pady=5)
+        
+        #Port filter
+        ctk.CTkLabel(filter_win, text="Port (leave blank for any):").pack(pady=(10, 0))
+        port_entry = ctk.CTkEntry(filter_win, placeholder_text="e.g., 443")
+        port_entry.insert(0, self.proxy.filter_rules["port"])
+        port_entry.pack(pady=5)
+        
+        #whitelist filter
+        ctk.CTkLabel(filter_win, text="Only Intercept Hosts containing (comma-separated):").pack(pady=(10, 0))
+        include_entry = ctk.CTkEntry(filter_win, placeholder_text="e.g., api.com, mytarget.org")
+        include_entry.insert(0, self.proxy.filter_rules["include_host"])
+        include_entry.pack(pady=5)
+        
+        #blacklist filter
+        ctk.CTkLabel(filter_win, text="DO NOT Intercept Hosts containing (comma-separated):").pack(pady=(10, 0))
+        exclude_entry = ctk.CTkEntry(filter_win, placeholder_text="e.g., microsoft.com, fonts.net")
+        exclude_entry.insert(0, self.proxy.filter_rules["exclude_host"])
+        exclude_entry.pack(pady=5)
+        
+        #Button Frame
+        btn_frame = ctk.CTkFrame(filter_win, fg_color="transparent")
+        btn_frame.pack(pady=20, fill="x", padx=20)
+        
+        def save_filters():
+            self.proxy.filter_rules["protocol"] = protocol_var.get()
+            self.proxy.filter_rules["port"] = port_entry.get().strip()
+            self.proxy.filter_rules["include_host"] = include_entry.get().strip()
+            self.proxy.filter_rules["exclude_host"] = exclude_entry.get().strip()
+            
+            # Visual feedback on the main button if filters are active
+            active_filters = any([
+                self.proxy.filter_rules["protocol"] != "All",
+                self.proxy.filter_rules["port"],
+                self.proxy.filter_rules["include_host"],
+                self.proxy.filter_rules["exclude_host"]
+            ])
+            
+            if active_filters:
+                self.filter_btn.configure(fg_color="#0059b3", text="Filters (Active) ⚙️")
+            else:
+                self.filter_btn.configure(fg_color="#404040", text="Filters ⚙️")
+            
+            filter_win.destroy() # Close the popup
+
+
+        def clear_filters():
+            # Reset dictionary to defaults
+            self.proxy.filter_rules = {
+                "protocol": "All",
+                "port": "",
+                "include_host": "",
+                "exclude_host": ""
+            }
+            # Reset button visual
+            self.filter_btn.configure(fg_color="#404040", text="Filters ⚙️")
+            filter_win.destroy() # Close the popup
+            
+        # Add the buttons side by side
+        ctk.CTkButton(
+            btn_frame, text="Clear Filters", fg_color="#8b2c2c", hover_color="#5c1d1d", width=1, command=clear_filters
+        ).pack(side="left", expand=True, fill="x", padx=5)
+        
+        ctk.CTkButton(
+            btn_frame, text="Save Filters", width=1, command=save_filters
+        ).pack(side="left", expand=True, fill="x", padx=5)
 
 
     def open_browser(self):

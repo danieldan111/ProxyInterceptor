@@ -79,7 +79,6 @@ class AsyncProxyServer:
 
 
     def forward_request(self, req_id, modified_data=None):
-        """Thread-safe method called by the GUI to release a paused request, optionally with new data."""
         if hasattr(self, 'pending_requests') and req_id in self.pending_requests:
             # If the GUI sent us modified text, save it
             if modified_data is not None:
